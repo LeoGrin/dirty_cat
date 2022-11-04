@@ -18,8 +18,8 @@ morphological similarities between strings.
 from typing import Dict, List, Literal, Tuple
 import numpy as np
 from sklearn.base import BaseEstimator, TransformerMixin
-from sklearn.utils import murmurhash3_32
-from joblib import Parallel, delayed
+from sklearn.utils import murmurhash3_32, gen_even_slices
+from joblib import Parallel, delayed, effective_n_jobs
 
 from ._fast_hash import ngram_min_hash
 from ._string_distances import get_unique_ngrams
@@ -162,6 +162,45 @@ class MinHashEncoder(BaseEstimator, TransformerMixin):
                 ]
             )
 
+    def compute_hash_vector(self, x_array) -> np.array:
+        """
+        Function called by joblib Parallel to compute the hash.
+
+        Check if the string is in the hash dictionary, if not, compute the hash using
+        the specified hashing function and add it to the dictionary.
+
+        Parameters
+        ----------
+        x : str
+            The string to encode.
+
+        Returns
+        -------
+        np.array of shape (n_components, )
+            The encoded string, using specified encoding scheme.
+        """
+        res = np.zeros((len(x_array), self.n_components))
+        for i, x in enumerate(x_array):
+            if x not in self.hash_dict_:
+                if x == "NAN":  # true if x is a missing value
+                    self.hash_dict_[x] = np.zeros(self.n_components)
+                else:
+                    if self.hashing == "fast":
+                        self.hash_dict_[x] = self.get_fast_hash(x)
+                    elif self.hashing == "murmur":
+                        self.hash_dict_[x] = self.minhash(
+                            x,
+                            n_components=self.n_components,
+                            ngram_range=self.ngram_range
+                        )
+                    else:
+                        raise ValueError("hashing function should be either 'fast' or"
+                                         "'murmur', got '{}'"
+                                         "".format(self.hashing))
+            res[i] = self.hash_dict_[x]
+        #return self.hash_dict_[x]
+        return res
+
     def compute_hash(self, x) -> np.array:
         """
         Function called by joblib Parallel to compute the hash.
@@ -196,7 +235,6 @@ class MinHashEncoder(BaseEstimator, TransformerMixin):
                                      "'murmur', got '{}'"
                                      "".format(self.hashing))
         return self.hash_dict_[x]
-
     def fit(self, X, y=None) -> "MinHashEncoder":
         """
         Fit the MinHashEncoder to X. In practice, just initializes a dictionary
@@ -218,7 +256,7 @@ class MinHashEncoder(BaseEstimator, TransformerMixin):
         self.hash_dict_ = LRUDict(capacity=self._capacity)
         return self
 
-    def transform(self, X) -> np.array:
+    def transform(self, X, batch=True) -> np.array:
         """
         Transform X using specified encoding scheme.
 
@@ -258,9 +296,19 @@ class MinHashEncoder(BaseEstimator, TransformerMixin):
                 X[~(X == X)] = "NAN"  # this will be replaced by a vector of zeroes by compute_hash
 
         # Compute the hashes for unique values
+        n_jobs = effective_n_jobs(self.n_jobs)
+        print(n_jobs)
         unique_x, indices_x = np.unique(X, return_inverse=True)
-        unique_x_trans = Parallel(n_jobs=self.n_jobs)(delayed(self.compute_hash)(x) for x in unique_x)
-        # Match the hashes of the unique value to the original values
-        X_out = np.stack(unique_x_trans)[indices_x].reshape(len(X), X.shape[1] * self.n_components)
+
+        if batch:
+            unique_x_trans = Parallel(n_jobs=self.n_jobs)(delayed(self.compute_hash_vector)(unique_x[idx_slice]) for
+                                                      idx_slice in gen_even_slices(len(unique_x), n_jobs))
+            # Match the hashes of the unique value to the original values
+            X_out = np.concatenate(unique_x_trans)[indices_x].reshape(len(X), X.shape[1] * self.n_components)
+
+        else:
+            unique_x_trans = Parallel(n_jobs=self.n_jobs)(delayed(self.compute_hash)(x) for x in unique_x)
+            X_out = np.stack(unique_x_trans)[indices_x].reshape(len(X), X.shape[1] * self.n_components)
+
 
         return X_out.astype(np.float64)  # The output is an int32 before conversion
