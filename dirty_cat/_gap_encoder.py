@@ -32,6 +32,8 @@ from sklearn.utils import check_random_state, gen_batches
 from sklearn.utils.extmath import row_norms, safe_sparse_dot
 from sklearn.utils.fixes import _object_dtype_isnan
 from sklearn.utils.validation import check_is_fitted
+import time
+from joblib import Parallel, delayed
 
 from ._utils import check_input, parse_version
 
@@ -99,6 +101,7 @@ class GapEncoderColumn(BaseEstimator, TransformerMixin):
         the topics W.
         """
         # Init n-grams counts vectorizer
+        print("init ngrams count vectorizer")
         if self.hashing:
             self.ngrams_count_ = HashingVectorizer(
                 analyzer=self.analyzer,
@@ -120,6 +123,7 @@ class GapEncoderColumn(BaseEstimator, TransformerMixin):
             )
             if self.add_words:
                 self.word_count_ = CountVectorizer(dtype=np.float64)
+        print("fit ngrams count vectorizer")
 
         # Init H_dict_ with empty dict to train from scratch
         self.H_dict_ = dict()
@@ -129,6 +133,7 @@ class GapEncoderColumn(BaseEstimator, TransformerMixin):
         if self.add_words:  # Add word counts to unq_V
             unq_V2 = self.word_count_.fit_transform(unq_X)
             unq_V = sparse.hstack((unq_V, unq_V2), format="csr")
+        print("fit ngrams count vectorizer done")
 
         if not self.hashing:  # Build n-grams/word vocabulary
             if parse_version(sklearn_version) < parse_version("1.0"):
@@ -144,6 +149,7 @@ class GapEncoderColumn(BaseEstimator, TransformerMixin):
                     self.vocabulary = np.concatenate(
                         (self.vocabulary, self.word_count_.get_feature_names_out())
                     )
+        print("fit ngrams count vectorizer done2")
         _, self.n_vocab = unq_V.shape
         # Init the topics W given the n-grams counts V
         self.W_, self.A_, self.B_ = self._init_w(unq_V[lookup], X)
@@ -154,6 +160,7 @@ class GapEncoderColumn(BaseEstimator, TransformerMixin):
         if self.rescale_rho:
             # Make update rate per iteration independent of the batch_size
             self.rho_ = self.rho ** (self.batch_size / len(X))
+        print("fit ngrams count vectorizer done3")
         return unq_X, unq_V, lookup
 
     def _get_H(self, X: np.array) -> np.array:
@@ -259,6 +266,7 @@ class GapEncoderColumn(BaseEstimator, TransformerMixin):
         self
             Fitting GapEncoderColumn instance.
         """
+        print("Fit GapEncoderColumn")
         # Copy parameter rho
         self.rho_ = self.rho
         # Check if first item has str or np.str_ type
@@ -266,13 +274,16 @@ class GapEncoderColumn(BaseEstimator, TransformerMixin):
         # Make n-grams counts matrix unq_V
         unq_X, unq_V, lookup = self._init_vars(X)
         n_batch = (len(X) - 1) // self.batch_size + 1
-        del X
+        #del X
         # Get activations unq_H
         unq_H = self._get_H(unq_X)
+        #print("Score:", self.score(X))
 
         for n_iter_ in range(self.max_iter):
             # Loop over batches
+            start_time = time.time()
             for i, (unq_idx, idx) in enumerate(batch_lookup(lookup, n=self.batch_size)):
+                print(f"Batch {i+1}/{n_batch}", end="\r")
                 if i == n_batch - 1:
                     W_last = self.W_.copy()
                 # Update activations unq_H
@@ -300,6 +311,11 @@ class GapEncoderColumn(BaseEstimator, TransformerMixin):
                 if i == n_batch - 1:
                     # Compute the norm of the update of W in the last batch
                     W_change = np.linalg.norm(self.W_ - W_last) / np.linalg.norm(W_last)
+                    print(f"Batch {i + 1}/{n_batch} - W change: {W_change:.4f}")
+                    print("Tolerance: ", self.tol)
+            self.H_dict_.update(zip(unq_X, unq_H))
+            #print("Score:", self.score(X))
+            print(f"Epoch {n_iter_ + 1}/{self.max_iter} - Time: {time.time() - start_time:.2f}s")
 
             if (W_change < self.tol) and (n_iter_ >= self.min_iter - 1):
                 break  # Stop if the change in W is smaller than the tolerance
@@ -705,6 +721,7 @@ class GapEncoder(BaseEstimator, TransformerMixin):
         rescale_W: bool = True,
         max_iter_e_step: int = 20,
         handle_missing: Literal["error", "empty_impute"] = "zero_impute",
+        n_jobs: Optional[int] = None,
     ):
         self.ngram_range = ngram_range
         self.n_components = n_components
@@ -725,6 +742,7 @@ class GapEncoder(BaseEstimator, TransformerMixin):
         self.rescale_W = rescale_W
         self.max_iter_e_step = max_iter_e_step
         self.handle_missing = handle_missing
+        self.n_jobs = n_jobs
 
     def _more_tags(self) -> Dict[str, List[str]]:
         """
@@ -805,9 +823,14 @@ class GapEncoder(BaseEstimator, TransformerMixin):
         X = check_input(X)
         X = self._handle_missing(X)
         self.fitted_models_ = []
-        for k in range(X.shape[1]):
-            col_enc = self._create_column_gap_encoder()
-            self.fitted_models_.append(col_enc.fit(X[:, k]))
+        # for k in range(X.shape[1]):
+        #     col_enc = self._create_column_gap_encoder()
+        #     self.fitted_models_.append(col_enc.fit(X[:, k]))
+        # Parallelize the encoding of each column
+        self.fitted_models_ = Parallel(n_jobs=self.n_jobs)(
+            delayed(self._create_column_gap_encoder().fit)(X[:, k])
+            for k in range(X.shape[1])
+        )
         return self
 
     def transform(self, X) -> np.array:
