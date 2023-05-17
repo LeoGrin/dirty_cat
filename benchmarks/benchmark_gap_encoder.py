@@ -1,4 +1,9 @@
 """
+This benchmark compares the performance of different hyperparameter settings
+for the gap encoder, for different variables of the traffic dataset.
+"""
+
+"""
 Online Gamma-Poisson factorization of string arrays.
 The principle is as follows:
     1. Given an input string array X, we build its bag-of-n-grams
@@ -277,7 +282,7 @@ class GapEncoderColumn(BaseEstimator, TransformerMixin):
         #del X
         # Get activations unq_H
         unq_H = self._get_H(unq_X)
-        print("Score:", self.score(X))
+        #print("Score:", self.score(X))
 
         for n_iter_ in range(self.max_iter):
             # Loop over batches
@@ -314,7 +319,7 @@ class GapEncoderColumn(BaseEstimator, TransformerMixin):
                     print(f"Batch {i + 1}/{n_batch} - W change: {W_change:.4f}")
                     print("Tolerance: ", self.tol)
             self.H_dict_.update(zip(unq_X, unq_H))
-            print("Score:", self.score(X))
+            #print("Score:", self.score(X))
             print(f"Epoch {n_iter_ + 1}/{self.max_iter} - Time: {time.time() - start_time:.2f}s")
 
             if (W_change < self.tol) and (n_iter_ >= self.min_iter - 1):
@@ -1111,3 +1116,133 @@ def get_kmeans_prototypes(
     neighbors.fit(projected)
     indexes_prototypes = np.unique(neighbors.kneighbors(centers, 1)[-1])
     return np.sort(X[indexes_prototypes])
+
+
+from utils import default_parser, find_result, monitor
+
+#########################################################
+# Benchmarking accuracy and speed on actual datasets
+#########################################################
+
+benchmark_name = "gap_encoder_benchmark"
+
+@monitor(
+    memory=True,
+    time=True,
+    parametrize={
+        "hashing": [True, False],
+        "high_card_feature": [
+           "seqid",
+           "description",
+           "location",
+           "search_reason_for_stop",
+           "state",
+           "make",
+           "model",
+           "charge",
+           "driver_city",
+           "driver_state",
+           "dl_state",
+           "geolocation",
+        ],
+        "batch_size": [1000, 10000, 100000],
+        "n_components": [10, 20, 30],
+        "ngram_range": [(2, 4), (3, 5), (4, 6)],
+        "analyzer": ["char", "char_wb", "word"],
+        "init": ["k-means++", "random", "k-means"],
+        "tol": [1e-3, 1e-4, 1e-6],
+        "min_iter": [1, 2, 3],
+        "max_iter": [3, 5, 10],
+        "gamma_shape_prior": [1.1, 1.2, 1.3],
+        "gamma_scale_prior": [1.0, 1.1, 1.2],
+        "rho": [0.93, 0.95, 0.97],
+        "rescale_rho": [True, False],
+        "rescale_W": [True, False],
+        "max_iter_e_step": [10, 20, 30],
+        "random_state": [1, 2, 3],
+    },
+    save_as=benchmark_name,
+    repeat=10,
+)
+def benchmark(
+    encoder: Literal["hash", "count"],
+    dataset_name: str,
+    analyser: Literal["char_wb", "char", "word"],
+    ngram_range: tuple,
+):
+    left_table, right_table, gt = fetch_data(dataset_name)
+
+    start_time = perf_counter()
+    joined_fj = fuzzy_join(
+        left_table,
+        right_table,
+        how="left",
+        left_on="title",
+        right_on="title",
+        encoder=encoder,
+        analyzer=analyser,
+        ngram_range=ngram_range,
+    )
+    end_time = perf_counter()
+
+    pr, re, f1 = evaluate(
+        list(zip(joined_fj["title_x"], joined_fj["title_y"])),
+        list(zip(gt["title_l"], gt["title_r"])),
+    )
+
+    res_dic = {
+        "precision": pr,
+        "recall": re,
+        "f1": f1,
+        "time_fj": end_time - start_time,
+    }
+
+    return res_dic
+
+
+def plot(df: pd.DataFrame):
+    sns.set_theme(style="ticks", palette="pastel")
+
+    n_datasets = len(np.unique(df["dataset_name"]))
+    n_rows = min(n_datasets, 3)
+    f, axes = plt.subplots(
+        n_rows,
+        math.ceil(n_datasets / n_rows),
+        squeeze=False,
+        figsize=(20, 5),
+    )
+    # Create the subplots but indexed by 1 value
+    for i, dataset_name in enumerate(np.unique(df["dataset_name"])):
+        sns.scatterplot(
+            x="time_fj",
+            y="f1",
+            hue="encoder",
+            style="ngram_range",
+            size="analyser",
+            alpha=0.8,
+            data=df[df["dataset_name"] == dataset_name],
+            ax=axes[i % n_rows, i // n_rows],
+        )
+        axes[i % n_rows, i // n_rows].set_title(dataset_name)
+        # remove legend
+        axes[i % n_rows, i // n_rows].get_legend().remove()
+        # Put a legend to the right side if last row
+        if i == n_datasets - 1:
+            axes[i % n_rows, i // n_rows].legend(loc="center right")
+    plt.show()
+
+
+if __name__ == "__main__":
+    _args = ArgumentParser(
+        description="Benchmark for the batch feature of the MinHashEncoder.",
+        parents=[default_parser],
+    ).parse_args()
+
+    if _args.run:
+        df = benchmark()
+    else:
+        result_file = find_result(benchmark_name)
+        df = pd.read_csv(result_file)
+
+    if _args.plot:
+        plot(df)
